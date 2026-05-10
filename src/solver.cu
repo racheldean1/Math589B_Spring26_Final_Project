@@ -227,14 +227,11 @@ Result solve(double theta, double phi, double alpha) {
         std::sort(all_candidates.begin(), all_candidates.end());
 
         int max_refine = std::min((int)all_candidates.size(), 3);
-        std::printf("\n--- Angle well k=%d (Found %zu valid coarse candidates) ---\n", k, all_candidates.size());
 
         for (int c = 0; c < max_refine; c++) {
             double a_opt = all_candidates[c].a;
             double b_opt = all_candidates[c].b;
             double final_cost = DBL_MAX, final_l1 = 0.0, final_l2 = 0.0;
-
-            std::printf("Candidate %d: a=%f, b=%f, res_sq=%f\n", c, a_opt, b_opt, all_candidates[c].res_sq);
 
             bool converged = false;
             for (int iter = 0; iter < 50; iter++) {
@@ -243,19 +240,16 @@ Result solve(double theta, double phi, double alpha) {
                 compute_residual_and_jacobian(a_opt, b_opt, theta_eq, theta, phi, alpha, v1, v2, R, J, final_cost, final_l1, final_l2);
 
                 if (isnan(R.norm())) {
-                    std::printf("  Iter %d: Diverged (R is NaN).\n", iter);
                     break;
                 }
 
                 if (R.norm() < 1e-6) {
-                    std::printf("  Converged in %d iterations.\n", iter);
                     converged = true;
                     break;
                 }
 
                 Eigen::Vector2d delta = -J.inverse() * R;
                 if (isnan(delta.norm())) {
-                    std::printf("  Iter %d: Diverged (delta is NaN).\n", iter);
                     break;
                 }
 
@@ -282,7 +276,6 @@ Result solve(double theta, double phi, double alpha) {
                 best_result.l2 = final_l2;
                 best_result.cost = final_cost;
                 best_global_cost = final_cost;
-                std::printf("  -> New best global cost: %f\n", best_global_cost);
             }
         }
     }
