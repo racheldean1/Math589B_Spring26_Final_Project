@@ -269,7 +269,7 @@ Result solve(double theta, double phi, double alpha) {
     Eigen::Matrix4d A;
 
     A <<  0.0,  1.0,     0.0,  0.0,
-          1.0, -alpha,  0.0, -1.0,
+          1.0, -alpha,   0.0, -1.0,
          -1.0,  0.0,     0.0, -1.0,
           0.0, -1.0,    -1.0,  alpha;
 
@@ -342,16 +342,6 @@ Result solve(double theta, double phi, double alpha) {
 
     std::vector<Candidate> all_candidates;
 
-    /*
-       This follows the algorithm:
-       - several angle wells / sheets,
-       - several local-patch radii,
-       - GPU coarse search over (a,b),
-       - CPU Newton refinement afterwards.
-
-       The small radii are important because integrating backward from the
-       stable manifold can make very small (a,b) values land far from equilibrium.
-    */
     double radii[] = {
         1.0e-8, 3.0e-8,
         1.0e-7, 3.0e-7,
@@ -399,8 +389,10 @@ Result solve(double theta, double phi, double alpha) {
                     cudaMemcpy(h_b, d_b, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
                     cudaMemcpy(h_res, d_res, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
 
+                    std::vector<Candidate> local_candidates;
+
                     for (int i = 0; i < total_evals; i++) {
-                        if (h_res[i] < 1.0e2) {
+                        if (std::isfinite(h_res[i]) && h_res[i] < DBL_MAX) {
                             Candidate c;
                             c.a = h_a[i];
                             c.b = h_b[i];
@@ -409,8 +401,16 @@ Result solve(double theta, double phi, double alpha) {
                             c.theta_eff = theta_eff;
                             c.T = T;
                             c.nsteps = nsteps;
-                            all_candidates.push_back(c);
+                            local_candidates.push_back(c);
                         }
+                    }
+
+                    std::sort(local_candidates.begin(), local_candidates.end());
+
+                    int keep_per_gpu_launch = std::min((int) local_candidates.size(), 64);
+
+                    for (int j = 0; j < keep_per_gpu_launch; j++) {
+                        all_candidates.push_back(local_candidates[j]);
                     }
                 }
             }
@@ -425,16 +425,20 @@ Result solve(double theta, double phi, double alpha) {
     delete[] h_b;
     delete[] h_res;
 
-    std::sort(all_candidates.begin(), all_candidates.end());
-
     Result best;
     best.l1 = 0.0;
     best.l2 = 0.0;
     best.cost = DBL_MAX;
 
+    std::sort(all_candidates.begin(), all_candidates.end());
+
+    if (all_candidates.empty()) {
+        return best;
+    }
+
     double best_cost = DBL_MAX;
 
-    int max_refine = std::min((int) all_candidates.size(), 100);
+    int max_refine = std::min((int) all_candidates.size(), 500);
 
     for (int c = 0; c < max_refine; c++) {
         double a = all_candidates[c].a;
