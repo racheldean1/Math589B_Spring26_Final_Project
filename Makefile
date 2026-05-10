@@ -1,12 +1,12 @@
+SHELL := /bin/bash
 TARGET = solver
 NVCC   = nvcc
-NVCCFLAGS = -O2
-
+NVCCFLAGS = -O3 -std=c++17
 
 SRC = src/main.cu src/solver.cu
 
 all:
-	$(NVCC) $(NVCCFLAGS) $(SRC) -o $(TARGET)
+	source /etc/profile && module load eigen && $(NVCC) $(NVCCFLAGS) $$(pkg-config --cflags eigen3) $(SRC) -o $(TARGET)
 
 clean:
 	rm -f $(TARGET)
