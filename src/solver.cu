@@ -400,16 +400,19 @@ Result solve(double theta, double phi, double alpha) {
     std::vector<Candidate> all_candidates;
 
     double radii[] = {
+        1.0e-7, 3.0e-7,
+        1.0e-6, 3.0e-6,
         1.0e-5, 3.0e-5,
         1.0e-4, 3.0e-4,
         1.0e-3, 3.0e-3,
         1.0e-2, 3.0e-2,
         1.0e-1, 3.0e-1,
-        1.0, 3.0, 10.0, 30.0
+        1.0, 3.0, 10.0, 30.0, 60.0, 100.0
     };
 
     double horizons[] = {
-        4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0
+        4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0,
+        14.0, 16.0, 18.0, 20.0
     };
 
     int k_center = (int) std::llround(theta / (2.0 * M_PI));
@@ -466,7 +469,7 @@ Result solve(double theta, double phi, double alpha) {
 
                 std::sort(local_candidates.begin(), local_candidates.end());
 
-                int keep_per_launch = std::min((int) local_candidates.size(), 80);
+                int keep_per_launch = std::min((int) local_candidates.size(), 160);
 
                 for (int j = 0; j < keep_per_launch; j++) {
                     all_candidates.push_back(local_candidates[j]);
@@ -494,7 +497,7 @@ Result solve(double theta, double phi, double alpha) {
     double best_cost = DBL_MAX;
     double best_res = DBL_MAX;
 
-    int max_refine = std::min((int) all_candidates.size(), 600);
+    int max_refine = std::min((int) all_candidates.size(), 1200);
 
     for (int c = 0; c < max_refine; c++) {
         double a = all_candidates[c].a;
