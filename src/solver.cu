@@ -3,9 +3,8 @@
 #include <cfloat>
 #include "solver.hpp"
 
-#define NUM_SHEETS 5
-#define THREADS_PER_BLOCK 128
-#define BLOCKS_PER_SHEET 256
+#define THREADS 256
+#define BLOCKS 4096
 
 __device__ void system_dynamics(const double* state, double* deriv, double alpha) {
     double theta = state[0], phi = state[1], l1 = state[2], l2 = state[3];
@@ -27,147 +26,93 @@ __device__ void rk4_step(double* state, double dt, double alpha) {
     for(int i=0; i<4; i++) state[i] += (dt / 6.0) * (k1[i] + 2.0*k2[i] + 2.0*k3[i] + k4[i]);
 }
 
-__device__ void evaluate_F(double l1, double l2, double theta0, double phi0, double alpha, double& f1, double& f2, double& out_cost) {
-    double state[4] = {theta0, phi0, l1, l2};
-    double dt = 0.05;
-    out_cost = 0.0;
-    for(int step=0; step<400; step++) {
-        double u = -state[3]*cos(state[0]);
-        out_cost += ((1.0-cos(state[0])) + 0.5*state[1]*state[1] + 0.5*u*u)*dt;
-        rk4_step(state, dt, alpha);
-    }
-    f1 = state[0];
-    f2 = state[1];
-}
-
-__global__ void refined_shooting_kernel(double theta_input, double phi_input, double alpha,
-                                        double P00, double P01, double P10, double P11,
-                                        double* best_l1, double* best_l2, double* min_cost) {
-    int sheet_idx = blockIdx.y;
-    int k = sheet_idx - (NUM_SHEETS / 2);
-
-    double theta_norm = fmod(theta_input + M_PI, 2.0 * M_PI);
-    if (theta_norm < 0) theta_norm += 2.0 * M_PI;
-    theta_norm -= M_PI;
-
-    double target_theta = theta_norm + 2.0 * M_PI * k;
-
-    double l1_guess = P00 * target_theta + P01 * phi_input;
-    double l2_guess = P10 * target_theta + P11 * phi_input;
-
+__global__ void global_grid_search(double theta_input, double phi_input, double alpha,
+                                   double l1_min, double l1_max, double l2_min, double l2_max,
+                                   double* best_l1, double* best_l2, double* min_cost) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = gridDim.x * blockDim.x;
-
+    
     int grid_side = sqrt((double)total_threads);
     int row = tid / grid_side;
     int col = tid % grid_side;
-
-    double max_perturb = 8.0;
-    double dl1 = -max_perturb + 2.0 * max_perturb * ((double)row / (grid_side - 1));
-    double dl2 = -max_perturb + 2.0 * max_perturb * ((double)col / (grid_side - 1));
-
-    double opt_l1 = l1_guess + dl1;
-    double opt_l2 = l2_guess + dl2;
     
-    double f1, f2, cost;
-    evaluate_F(opt_l1, opt_l2, theta_input, phi_input, alpha, f1, f2, cost);
-    double current_err = f1*f1 + f2*f2;
-
-    double lr = 1e-3;
-    for(int iter=0; iter<50; iter++) {
-        if(current_err < 1e-8 || isnan(current_err)) break;
-
-        double eps = 1e-5;
-        double f1_l1, f2_l1, c_dummy;
-        evaluate_F(opt_l1 + eps, opt_l2, theta_input, phi_input, alpha, f1_l1, f2_l1, c_dummy);
-        double err_l1 = f1_l1*f1_l1 + f2_l1*f2_l1;
-        double J_l1 = (err_l1 - current_err) / eps;
-
-        double f1_l2, f2_l2;
-        evaluate_F(opt_l1, opt_l2 + eps, theta_input, phi_input, alpha, f1_l2, f2_l2, c_dummy);
-        double err_l2 = f1_l2*f1_l2 + f2_l2*f2_l2;
-        double J_l2 = (err_l2 - current_err) / eps;
-
-        double next_l1 = opt_l1 - lr * J_l1;
-        double next_l2 = opt_l2 - lr * J_l2;
-
-        double next_f1, next_f2, next_cost;
-        evaluate_F(next_l1, next_l2, theta_input, phi_input, alpha, next_f1, next_f2, next_cost);
-        double next_err = next_f1*next_f1 + next_f2*next_f2;
-
-        if (isnan(next_err) || next_err >= current_err) {
-            lr *= 0.5;
-        } else {
-            opt_l1 = next_l1;
-            opt_l2 = next_l2;
-            current_err = next_err;
-            cost = next_cost;
-            lr *= 1.2;
+    double l1 = l1_min + (l1_max - l1_min) * ((double)row / (grid_side - 1));
+    double l2 = l2_min + (l2_max - l2_min) * ((double)col / (grid_side - 1));
+    
+    double state[4] = {theta_input, phi_input, l1, l2};
+    double dt = 0.05;
+    double cost = 0.0;
+    
+    for(int step = 0; step < 400; step++) {
+        double u = -state[3] * cos(state[0]);
+        cost += ((1.0 - cos(state[0])) + 0.5 * state[1]*state[1] + 0.5 * u*u) * dt;
+        rk4_step(state, dt, alpha);
+        
+        if (isnan(state[0]) || isnan(state[1]) || isnan(state[2]) || isnan(state[3])) {
+            cost = 1e15;
+            break;
         }
     }
-
-    if (current_err > 1e-3) {
-        cost += 1000.0 * current_err;
+    
+    if (cost < 1e14) {
+        cost += 1000.0 * (state[0]*state[0] + state[1]*state[1]);
     }
-
-    int out_idx = sheet_idx * total_threads + tid;
-    best_l1[out_idx] = opt_l1;
-    best_l2[out_idx] = opt_l2;
-    min_cost[out_idx] = cost;
-}
-
-void solveARE(double alpha, double& P00, double& P01, double& P10, double& P11) {
-    double p12 = 1.0 + sqrt(2.0);
-    double p22 = -alpha + sqrt(alpha * alpha + 2.0 * p12 + 1.0);
-    double p11 = alpha * p12 + p22 * (p12 - 1.0);
-    P00 = p11; P01 = p12; P10 = p12; P11 = p22;
+    
+    best_l1[tid] = l1;
+    best_l2[tid] = l2;
+    min_cost[tid] = cost;
 }
 
 Result solve(double theta, double phi, double alpha) {
-    double P00, P01, P10, P11;
-    solveARE(alpha, P00, P01, P10, P11);
-
-    int threads = THREADS_PER_BLOCK;
-    int blocks_x = BLOCKS_PER_SHEET;
-    int sheets = NUM_SHEETS;
-    int total_evals = sheets * blocks_x * threads;
-
+    int total_evals = BLOCKS * THREADS;
     double *d_l1, *d_l2, *d_cost;
     cudaMalloc(&d_l1, total_evals * sizeof(double));
     cudaMalloc(&d_l2, total_evals * sizeof(double));
     cudaMalloc(&d_cost, total_evals * sizeof(double));
-
-    dim3 grid(blocks_x, sheets);
-    refined_shooting_kernel<<<grid, threads>>>(theta, phi, alpha, P00, P01, P10, P11, d_l1, d_l2, d_cost);
+    
+    double search_radius = 50.0;
+    
+    // Pass 1: Global coarse search
+    global_grid_search<<<BLOCKS, THREADS>>>(theta, phi, alpha, -search_radius, search_radius, -search_radius, search_radius, d_l1, d_l2, d_cost);
     cudaDeviceSynchronize();
-
+    
     double *h_l1 = new double[total_evals];
     double *h_l2 = new double[total_evals];
     double *h_cost = new double[total_evals];
-
+    
     cudaMemcpy(h_l1, d_l1, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_l2, d_l2, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_cost, d_cost, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
-
-    int best_idx = -1;
-    double min_c = 1e20;
-    for(int i = 0; i < total_evals; i++) {
-        if(!isnan(h_cost[i]) && h_cost[i] < min_c) {
-            min_c = h_cost[i];
-            best_idx = i;
-        }
+    
+    int best_idx = 0;
+    for(int i = 1; i < total_evals; i++) {
+        if(h_cost[i] < h_cost[best_idx]) best_idx = i;
     }
-
+    
+    double best_l1_val = h_l1[best_idx];
+    double best_l2_val = h_l2[best_idx];
+    
+    // Pass 2: Fine search around the best candidate
+    double fine_radius = 2.0;
+    global_grid_search<<<BLOCKS, THREADS>>>(theta, phi, alpha, best_l1_val - fine_radius, best_l1_val + fine_radius, best_l2_val - fine_radius, best_l2_val + fine_radius, d_l1, d_l2, d_cost);
+    cudaDeviceSynchronize();
+    
+    cudaMemcpy(h_l1, d_l1, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_l2, d_l2, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_cost, d_cost, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
+    
+    best_idx = 0;
+    for(int i = 1; i < total_evals; i++) {
+        if(h_cost[i] < h_cost[best_idx]) best_idx = i;
+    }
+    
     Result r;
-    if(best_idx >= 0) {
-        r.l1 = h_l1[best_idx];
-        r.l2 = h_l2[best_idx];
-        r.cost = min_c;
-    } else {
-        r.l1 = 0; r.l2 = 0; r.cost = 1e20;
-    }
-
+    r.l1 = h_l1[best_idx];
+    r.l2 = h_l2[best_idx];
+    r.cost = h_cost[best_idx];
+    
     cudaFree(d_l1); cudaFree(d_l2); cudaFree(d_cost);
     delete[] h_l1; delete[] h_l2; delete[] h_cost;
+    
     return r;
 }
