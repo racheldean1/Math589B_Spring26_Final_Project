@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <utility>
+#include <complex>
 
 #include <cuda_runtime.h>
 
@@ -50,8 +51,8 @@ void system_dynamics(const double* y, double* f, double alpha) {
     double l1    = y[2];
     double l2    = y[3];
 
-    double c = cos(theta);
     double s = sin(theta);
+    double c = cos(theta);
 
     f[0] = phi;
     f[1] = s - alpha * phi - l2 * c * c;
@@ -128,12 +129,8 @@ void coarse_search_kernel(
         double a = -radius + 2.0 * radius * ((double) row / (double) (grid_pts - 1));
         double b = -radius + 2.0 * radius * ((double) col / (double) (grid_pts - 1));
 
-        /*
-           Local stable patch near the equilibrium:
-           y0 = a B1 + b B2
-           where y0 = (theta, phi, lambda1, lambda2).
-        */
         double y[4];
+
         y[0] = a * b1_0 + b * b2_0;
         y[1] = a * b1_1 + b * b2_1;
         y[2] = a * b1_2 + b * b2_2;
@@ -162,6 +159,14 @@ void coarse_search_kernel(
             out_res[idx] = DBL_MAX;
         }
     }
+}
+
+Result fail_result() {
+    Result r;
+    r.l1 = 0.0;
+    r.l2 = 0.0;
+    r.cost = DBL_MAX;
+    return r;
 }
 
 std::pair<Eigen::Vector2d, double>
@@ -284,12 +289,19 @@ void compute_residual_and_jacobian(
     }
 }
 
-Result fail_result() {
-    Result r;
-    r.l1 = 0.0;
-    r.l2 = 0.0;
-    r.cost = DBL_MAX;
-    return r;
+double tail_cost(
+    double a,
+    double b,
+    const Eigen::Vector4d& B1,
+    const Eigen::Vector4d& B2,
+    const Eigen::Matrix2d& P
+) {
+    Eigen::Vector2d x0;
+
+    x0(0) = a * B1(0) + b * B2(0);
+    x0(1) = a * B1(1) + b * B2(1);
+
+    return 0.5 * x0.dot(P * x0);
 }
 
 Result solve(double theta, double phi, double alpha) {
@@ -303,16 +315,12 @@ Result solve(double theta, double phi, double alpha) {
         return exact;
     }
 
-    /*
-       Linearize the PMP system near the equilibrium.
-       This gives the local stable eigenspace basis B = [B1 B2].
-    */
     Eigen::Matrix4d A;
 
-    A <<  0.0,  1.0,     0.0,  0.0,
-          1.0, -alpha,   0.0, -1.0,
-         -1.0,  0.0,     0.0, -1.0,
-          0.0, -1.0,    -1.0,  alpha;
+    A <<  0.0,  1.0,    0.0,  0.0,
+          1.0, -alpha,  0.0, -1.0,
+         -1.0,  0.0,    0.0, -1.0,
+          0.0, -1.0,   -1.0,  alpha;
 
     Eigen::EigenSolver<Eigen::Matrix4d> es(A);
 
@@ -349,7 +357,23 @@ Result solve(double theta, double phi, double alpha) {
 
     B2.normalize();
 
-    int grid_pts = 256;
+    Eigen::Matrix2d X;
+    Eigen::Matrix2d L;
+
+    X << B1(0), B2(0),
+         B1(1), B2(1);
+
+    L << B1(2), B2(2),
+         B1(3), B2(3);
+
+    if (fabs(X.determinant()) < 1.0e-14) {
+        return fail_result();
+    }
+
+    Eigen::Matrix2d P = L * X.inverse();
+    P = 0.5 * (P + P.transpose());
+
+    int grid_pts = 129;
     int total_evals = grid_pts * grid_pts;
 
     double *d_a, *d_b, *d_res;
@@ -375,15 +399,7 @@ Result solve(double theta, double phi, double alpha) {
 
     std::vector<Candidate> all_candidates;
 
-    /*
-       Small radii matter because backward integration expands the stable directions.
-       Large radii are included for the harder/high-energy cases.
-    */
     double radii[] = {
-        1.0e-9, 3.0e-9,
-        1.0e-8, 3.0e-8,
-        1.0e-7, 3.0e-7,
-        1.0e-6, 3.0e-6,
         1.0e-5, 3.0e-5,
         1.0e-4, 3.0e-4,
         1.0e-3, 3.0e-3,
@@ -392,16 +408,10 @@ Result solve(double theta, double phi, double alpha) {
         1.0, 3.0, 10.0, 30.0
     };
 
-    /*
-       Longer horizons make the artificial starting point closer to equilibrium,
-       which improves the cost and lambda accuracy.
-    */
-    double horizons[] = {4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0};
+    double horizons[] = {
+        4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0
+    };
 
-    /*
-       This follows the angle-well part of the algorithm directly:
-       choose k near theta/(2*pi), then theta_eff = theta - 2*pi*k.
-    */
     int k_center = (int) std::llround(theta / (2.0 * M_PI));
 
     for (double T : horizons) {
@@ -410,6 +420,7 @@ Result solve(double theta, double phi, double alpha) {
 
         for (int dk = -2; dk <= 2; dk++) {
             int k = k_center + dk;
+
             double theta_eff = theta - 2.0 * M_PI * (double) k;
 
             for (double radius : radii) {
@@ -455,7 +466,7 @@ Result solve(double theta, double phi, double alpha) {
 
                 std::sort(local_candidates.begin(), local_candidates.end());
 
-                int keep_per_launch = std::min((int) local_candidates.size(), 96);
+                int keep_per_launch = std::min((int) local_candidates.size(), 80);
 
                 for (int j = 0; j < keep_per_launch; j++) {
                     all_candidates.push_back(local_candidates[j]);
@@ -483,7 +494,7 @@ Result solve(double theta, double phi, double alpha) {
     double best_cost = DBL_MAX;
     double best_res = DBL_MAX;
 
-    int max_refine = std::min((int) all_candidates.size(), 800);
+    int max_refine = std::min((int) all_candidates.size(), 600);
 
     for (int c = 0; c < max_refine; c++) {
         double a = all_candidates[c].a;
@@ -563,21 +574,22 @@ Result solve(double theta, double phi, double alpha) {
             b += step_size * delta(1);
         }
 
-        /*
-           Prefer converged solutions with smallest cost.
-           If nothing converges, keep the closest residual so we do not return
-           DBL_MAX unless the search completely fails.
-        */
-        if (converged && final_cost < best_cost) {
-            best.l1 = final_l1;
-            best.l2 = final_l2;
-            best.cost = final_cost;
-            best_cost = final_cost;
-            best_res = final_res;
+        if (converged) {
+            double total_cost = final_cost + tail_cost(a, b, B1, B2, P);
+
+            if (std::isfinite(total_cost) && total_cost < best_cost) {
+                best.l1 = final_l1;
+                best.l2 = final_l2;
+                best.cost = total_cost;
+                best_cost = total_cost;
+                best_res = final_res;
+            }
         } else if (best_cost == DBL_MAX && final_res < best_res && std::isfinite(final_cost)) {
+            double total_cost = final_cost + tail_cost(a, b, B1, B2, P);
+
             best.l1 = final_l1;
             best.l2 = final_l2;
-            best.cost = final_cost;
+            best.cost = total_cost;
             best_res = final_res;
         }
     }
