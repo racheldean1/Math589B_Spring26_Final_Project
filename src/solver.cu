@@ -19,71 +19,117 @@ __device__ __host__ void system_dynamics(const double* state, double* deriv, dou
 }
 
 // Backward RK4: dt is negative
-__device__ __host__ void rk4_step_backward(double* state, double dt, double alpha) {
+__device__ __host__ void rk4_step_backward(double* state, double dt, double alpha, double& cost_accum) {
     double k1[4], k2[4], k3[4], k4[4], temp[4];
-    // Using the same system dynamics, but taking a negative time step
+    
+    // Cost derivative is L = (1 - cos(theta)) + 0.5 * phi^2 + 0.5 * u^2
+    // where u = -l2 * cos(theta)
+    auto calc_L = [](const double* s) {
+        double u = -s[3] * cos(s[0]);
+        return (1.0 - cos(s[0])) + 0.5 * s[1]*s[1] + 0.5 * u*u;
+    };
+
     system_dynamics(state, k1, alpha);
+    double c1 = calc_L(state);
+
     for(int i=0; i<4; i++) temp[i] = state[i] + 0.5 * dt * k1[i];
     system_dynamics(temp, k2, alpha);
+    double c2 = calc_L(temp);
+
     for(int i=0; i<4; i++) temp[i] = state[i] + 0.5 * dt * k2[i];
     system_dynamics(temp, k3, alpha);
+    double c3 = calc_L(temp);
+
     for(int i=0; i<4; i++) temp[i] = state[i] + dt * k3[i];
     system_dynamics(temp, k4, alpha);
+    double c4 = calc_L(temp);
+
     for(int i=0; i<4; i++) state[i] += (dt / 6.0) * (k1[i] + 2.0*k2[i] + 2.0*k3[i] + k4[i]);
+    
+    // Accumulate cost (remember dt is negative, but cost integrates forward. 
+    // Since we go backward, we subtract the negative dt to add positive cost, or just add fabs(dt))
+    cost_accum += (fabs(dt) / 6.0) * (c1 + 2.0*c2 + 2.0*c3 + c4);
 }
 
-struct Candidate {
-    double a, b, res_sq, cost;
-};
-
-__global__ void coarse_search_kernel(double theta_target, double phi_target, double alpha,
+__global__ void coarse_search_kernel(double theta_start, double phi_start, double alpha,
                                      double v1_0, double v1_1, double v1_2, double v1_3,
                                      double v2_0, double v2_1, double v2_2, double v2_3,
                                      double r_min, double r_max, int grid_pts,
-                                     double* out_a, double* out_b, double* out_res, double* out_cost) {
+                                     double* out_a, double* out_b, double* out_res, double* out_cost, double* out_l1, double* out_l2) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = gridDim.x * blockDim.x;
-    
+
     for(int i = tid; i < grid_pts * grid_pts; i += total_threads) {
         int row = i / grid_pts;
         int col = i % grid_pts;
-        
+
         double a = r_min + (r_max - r_min) * ((double)row / (grid_pts - 1));
         double b = r_min + (r_max - r_min) * ((double)col / (grid_pts - 1));
-        
+
         double state[4] = {
             a * v1_0 + b * v2_0,
             a * v1_1 + b * v2_1,
             a * v1_2 + b * v2_2,
             a * v1_3 + b * v2_3
         };
-        
+
         double dt = -0.05;
         double cost = 0.0;
         bool valid = true;
-        
+
         for(int step = 0; step < 400; step++) {
-            rk4_step_backward(state, dt, alpha);
+            rk4_step_backward(state, dt, alpha, cost);
             if (isnan(state[0]) || isinf(state[0])) {
                 valid = false;
                 break;
             }
-            // Forward cost accumulation would technically be computed here 
-            // but we focus on shooting residual first for finding the trajectory
         }
-        
+
         if (valid) {
-            double res_sq = (state[0] - theta_target)*(state[0] - theta_target) + 
-                            (state[1] - phi_target)*(state[1] - phi_target);
+            double res_sq = (state[0] - theta_start)*(state[0] - theta_start) + 
+                            (state[1] - phi_start)*(state[1] - phi_start);
             out_res[i] = res_sq;
             out_a[i] = a;
             out_b[i] = b;
-            // Approximate cost logic omitted for brevity in coarse search
-            out_cost[i] = 1.0;
+            out_cost[i] = cost;
+            out_l1[i] = state[2];
+            out_l2[i] = state[3];
         } else {
             out_res[i] = DBL_MAX;
+            out_cost[i] = DBL_MAX;
         }
     }
+}
+
+void compute_residual_and_jacobian(double a, double b, double theta_start, double phi_start, double alpha,
+                                   Eigen::Vector4d v1, Eigen::Vector4d v2,
+                                   Eigen::Vector2d& R, Eigen::Matrix2d& J, double& cost_val, double& l1_val, double& l2_val) {
+    auto eval_trajectory = [&](double a_val, double b_val, double& l1, double& l2) {
+        double state[4] = {
+            a_val * v1[0] + b_val * v2[0],
+            a_val * v1[1] + b_val * v2[1],
+            a_val * v1[2] + b_val * v2[2],
+            a_val * v1[3] + b_val * v2[3]
+        };
+        double dt = -0.05;
+        double cost = 0.0;
+        for(int step = 0; step < 400; step++) rk4_step_backward(state, dt, alpha, cost);
+        l1 = state[2];
+        l2 = state[3];
+        return std::make_pair(Eigen::Vector2d(state[0] - theta_start, state[1] - phi_start), cost);
+    };
+
+    auto base_eval = eval_trajectory(a, b, l1_val, l2_val);
+    R = base_eval.first;
+    cost_val = base_eval.second;
+
+    double eps = 1e-5;
+    double dummy1, dummy2;
+    Eigen::Vector2d R_da = eval_trajectory(a + eps, b, dummy1, dummy2).first;
+    Eigen::Vector2d R_db = eval_trajectory(a, b + eps, dummy1, dummy2).first;
+
+    J.col(0) = (R_da - R) / eps;
+    J.col(1) = (R_db - R) / eps;
 }
 
 Result solve(double theta, double phi, double alpha) {
@@ -108,36 +154,40 @@ Result solve(double theta, double phi, double alpha) {
         }
     }
 
-    // 2. Prepare Angle Wells (Simplified to just target for now, algorithm scales to theta +/- 2k*pi)
     double best_global_cost = DBL_MAX;
     Result best_result = {0.0, 0.0, DBL_MAX};
-    
-    int k_offsets[1] = {0}; // Add {-2, -1, 0, 1, 2} per algorithm
+
+    // 2. Prepare Angle Wells
+    int k_offsets[] = {-1, 0, 1}; // Check typical wrapping offsets
     for (int k : k_offsets) {
-        double theta_target = theta + k * 2.0 * M_PI;
-        
+        double theta_shifted = theta - k * 2.0 * M_PI;
+
         // 3. GPU Stage: Coarse Search
         int grid_pts = 100;
         int total_evals = grid_pts * grid_pts;
-        double *d_a, *d_b, *d_res, *d_cost;
+        double *d_a, *d_b, *d_res, *d_cost, *d_l1, *d_l2;
         cudaMalloc(&d_a, total_evals * sizeof(double));
         cudaMalloc(&d_b, total_evals * sizeof(double));
         cudaMalloc(&d_res, total_evals * sizeof(double));
         cudaMalloc(&d_cost, total_evals * sizeof(double));
-        
-        double r_min = -5.0, r_max = 5.0;
-        coarse_search_kernel<<<BLOCKS, THREADS>>>(theta_target, phi, alpha, 
-            v1[0], v1[1], v1[2], v1[3], 
-            v2[0], v2[1], v2[2], v2[3], 
-            r_min, r_max, grid_pts, d_a, d_b, d_res, d_cost);
-            
+        cudaMalloc(&d_l1, total_evals * sizeof(double));
+        cudaMalloc(&d_l2, total_evals * sizeof(double));
+
+        double r_min = -10.0, r_max = 10.0;
+        coarse_search_kernel<<<BLOCKS, THREADS>>>(theta_shifted, phi, alpha,
+            v1[0], v1[1], v1[2], v1[3],
+            v2[0], v2[1], v2[2], v2[3],
+            r_min, r_max, grid_pts, d_a, d_b, d_res, d_cost, d_l1, d_l2);
+        cudaDeviceSynchronize();
+
         double *h_a = new double[total_evals];
         double *h_b = new double[total_evals];
         double *h_res = new double[total_evals];
         cudaMemcpy(h_a, d_a, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_b, d_b, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_res, d_res, total_evals * sizeof(double), cudaMemcpyDeviceToHost);
-        
+
+        // Find top candidate
         int best_idx = -1;
         double min_res = DBL_MAX;
         for(int i = 0; i < total_evals; i++) {
@@ -146,34 +196,40 @@ Result solve(double theta, double phi, double alpha) {
                 best_idx = i;
             }
         }
-        
-        // 4. CPU Stage: Newton Refinement (Stubbed)
-        // Use h_a[best_idx] and h_b[best_idx] as initial guess.
-        // Integrate backwards, compute finite difference Jacobian, refine.
-        // Assuming successful refinement provides exact (l1, l2) at t=0
-        if (best_idx != -1) {
+
+        // 4. CPU Stage: Newton refinement
+        if (best_idx != -1 && min_res < 100.0) {
             double a_opt = h_a[best_idx];
             double b_opt = h_b[best_idx];
-            
-            // Recover state at T
-            double state[4] = {a_opt*v1[0] + b_opt*v2[0], a_opt*v1[1] + b_opt*v2[1], 
-                               a_opt*v1[2] + b_opt*v2[2], a_opt*v1[3] + b_opt*v2[3]};
-            
-            // Back-propagate to get exact l1, l2 at start
-            double dt = -0.05;
-            for(int step = 0; step < 400; step++) rk4_step_backward(state, dt, alpha);
-            
-            if (1.0 < best_global_cost) { // cost computation proxy
-                best_result.l1 = state[2];
-                best_result.l2 = state[3];
-                best_result.cost = min_res; // Placeholder for true cost J
-                best_global_cost = 1.0;
+            double final_cost = DBL_MAX, final_l1 = 0.0, final_l2 = 0.0;
+
+            bool converged = false;
+            for (int iter = 0; iter < 15; iter++) {
+                Eigen::Vector2d R;
+                Eigen::Matrix2d J;
+                compute_residual_and_jacobian(a_opt, b_opt, theta_shifted, phi, alpha, v1, v2, R, J, final_cost, final_l1, final_l2);
+
+                if (R.norm() < 1e-6) {
+                    converged = true;
+                    break;
+                }
+
+                Eigen::Vector2d delta = -J.inverse() * R;
+                a_opt += delta(0);
+                b_opt += delta(1);
+            }
+
+            if (converged && final_cost < best_global_cost) {
+                best_result.l1 = final_l1;
+                best_result.l2 = final_l2;
+                best_result.cost = final_cost;
+                best_global_cost = final_cost;
             }
         }
-        
-        cudaFree(d_a); cudaFree(d_b); cudaFree(d_res); cudaFree(d_cost);
+
+        cudaFree(d_a); cudaFree(d_b); cudaFree(d_res); cudaFree(d_cost); cudaFree(d_l1); cudaFree(d_l2);
         delete[] h_a; delete[] h_b; delete[] h_res;
     }
-    
+
     return best_result;
 }
