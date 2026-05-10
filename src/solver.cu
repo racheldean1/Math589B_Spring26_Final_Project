@@ -1,6 +1,6 @@
 #include <iostream>
 #include <cmath>
-#include <Eigen/Dense>
+#include "../Eigen/Dense"
 #include "solver.hpp"
 
 using namespace Eigen;
@@ -146,4 +146,3 @@ Result solve(double theta, double phi, double alpha) {
 
     return r;
 }
-
