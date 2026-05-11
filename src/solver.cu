@@ -399,21 +399,39 @@ Result solve(double theta, double phi, double alpha) {
 
     std::vector<Candidate> all_candidates;
 
-    double radii[] = {
-        1.0e-7, 3.0e-7,
-        1.0e-6, 3.0e-6,
-        1.0e-5, 3.0e-5,
-        1.0e-4, 3.0e-4,
-        1.0e-3, 3.0e-3,
-        1.0e-2, 3.0e-2,
-        1.0e-1, 3.0e-1,
-        1.0, 3.0, 10.0, 30.0, 60.0, 100.0
-    };
+    std::vector<double> radii;
+    std::vector<double> horizons;
 
-    double horizons[] = {
-        4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0,
-        14.0, 16.0, 18.0, 20.0
-    };
+    if (fabs(phi) >= 4.0) {
+        radii = {
+            1.0e-7, 3.0e-7,
+            1.0e-6, 3.0e-6,
+            1.0e-5, 3.0e-5,
+            1.0e-4, 3.0e-4,
+            1.0e-3, 3.0e-3,
+            1.0e-2, 3.0e-2,
+            1.0e-1, 3.0e-1,
+            1.0, 3.0, 10.0, 30.0, 60.0, 100.0
+        };
+
+        horizons = {
+            4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0,
+            14.0, 16.0, 18.0
+        };
+    } else {
+        radii = {
+            1.0e-5, 3.0e-5,
+            1.0e-4, 3.0e-4,
+            1.0e-3, 3.0e-3,
+            1.0e-2, 3.0e-2,
+            1.0e-1, 3.0e-1,
+            1.0, 3.0, 10.0, 30.0
+        };
+
+        horizons = {
+            4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0
+        };
+    }
 
     int k_center = (int) std::llround(theta / (2.0 * M_PI));
 
@@ -497,7 +515,9 @@ Result solve(double theta, double phi, double alpha) {
     double best_cost = DBL_MAX;
     double best_res = DBL_MAX;
 
-    int max_refine = std::min((int) all_candidates.size(), 1200);
+    int max_refine = (fabs(phi) >= 4.0)
+        ? std::min((int) all_candidates.size(), 900)
+        : std::min((int) all_candidates.size(), 450);
 
     for (int c = 0; c < max_refine; c++) {
         double a = all_candidates[c].a;
@@ -578,14 +598,86 @@ Result solve(double theta, double phi, double alpha) {
         }
 
         if (converged) {
-            double total_cost = final_cost + tail_cost(a, b, B1, B2, P);
+            int polish_nsteps = 2 * nsteps;
+            double T_used = -dt * (double)nsteps;
+            double polish_dt = -T_used / (double)polish_nsteps;
+
+            double polish_l1 = final_l1;
+            double polish_l2 = final_l2;
+            double polish_cost = final_cost;
+            double polish_res = final_res;
+
+            for (int piter = 0; piter < 12; piter++) {
+                Eigen::Vector2d Rpolish;
+                Eigen::Matrix2d Jpolish;
+
+                compute_residual_and_jacobian(
+                    a, b,
+                    theta_eff, phi, alpha,
+                    B1, B2,
+                    polish_nsteps, polish_dt,
+                    Rpolish, Jpolish,
+                    polish_cost, polish_l1, polish_l2
+                );
+
+                if (!std::isfinite(Rpolish.norm()) || !std::isfinite(polish_cost)) {
+                    break;
+                }
+
+                polish_res = Rpolish.norm();
+
+                if (polish_res < 1.0e-11) {
+                    break;
+                }
+
+                Eigen::Vector2d delta = Jpolish.fullPivLu().solve(-Rpolish);
+
+                if (!std::isfinite(delta.norm())) {
+                    break;
+                }
+
+                double step_size = 1.0;
+                bool accepted = false;
+                double current_norm = Rpolish.norm();
+
+                for (int ls = 0; ls < 20; ls++) {
+                    double trial_a = a + step_size * delta(0);
+                    double trial_b = b + step_size * delta(1);
+
+                    double trial_l1, trial_l2;
+
+                    Eigen::Vector2d trial_R = eval_trajectory(
+                        trial_a, trial_b,
+                        theta_eff, phi, alpha,
+                        B1, B2,
+                        polish_nsteps, polish_dt,
+                        trial_l1, trial_l2
+                    ).first;
+
+                    if (std::isfinite(trial_R.norm()) && trial_R.norm() < current_norm) {
+                        accepted = true;
+                        break;
+                    }
+
+                    step_size *= 0.5;
+                }
+
+                if (!accepted) {
+                    break;
+                }
+
+                a += step_size * delta(0);
+                b += step_size * delta(1);
+            }
+
+            double total_cost = polish_cost + tail_cost(a, b, B1, B2, P);
 
             if (std::isfinite(total_cost) && total_cost < best_cost) {
-                best.l1 = final_l1;
-                best.l2 = final_l2;
+                best.l1 = polish_l1;
+                best.l2 = polish_l2;
                 best.cost = total_cost;
                 best_cost = total_cost;
-                best_res = final_res;
+                best_res = polish_res;
             }
         } else if (best_cost == DBL_MAX && final_res < best_res && std::isfinite(final_cost)) {
             double total_cost = final_cost + tail_cost(a, b, B1, B2, P);
