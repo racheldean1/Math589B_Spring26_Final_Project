@@ -305,24 +305,20 @@ double tail_cost(
 }
 
 Result solve(double theta, double phi, double alpha) {
-    double theta_mod = std::remainder(theta, 2.0 * M_PI);
+    bool reflected = false;
 
     /*
-       Symmetry of the pendulum problem:
-       If (theta, phi) is reflected to (-theta, -phi), the optimal cost is the same,
-       while lambda changes sign. This avoids a slow positive high-velocity sheet.
+       Symmetry:
+       For positive-positive high velocity cases, solve the reflected problem
+       (-theta, -phi). Cost is unchanged, and lambda changes sign.
     */
-    if (phi > 0.0 && theta > 1.0e-12) {
-        Result mirror = solve(-theta, -phi, alpha);
-
-        if (std::isfinite(mirror.cost) && mirror.cost < DBL_MAX) {
-            Result reflected;
-            reflected.l1 = -mirror.l1;
-            reflected.l2 = -mirror.l2;
-            reflected.cost = mirror.cost;
-            return reflected;
-        }
+    if (theta > 1.0e-12 && phi > 1.0e-12) {
+        theta = -theta;
+        phi = -phi;
+        reflected = true;
     }
+
+    double theta_mod = std::remainder(theta, 2.0 * M_PI);
 
     if (fabs(theta_mod) < 1.0e-13 && fabs(phi) < 1.0e-13) {
         Result exact;
@@ -428,12 +424,11 @@ Result solve(double theta, double phi, double alpha) {
             1.0e-3, 3.0e-3,
             1.0e-2, 3.0e-2,
             1.0e-1, 3.0e-1,
-            1.0, 3.0, 10.0, 30.0, 60.0, 100.0
+            1.0, 3.0, 10.0, 30.0, 60.0
         };
 
         horizons = {
-            4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0,
-            14.0, 16.0, 18.0
+            4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 14.0
         };
     } else {
         radii = {
@@ -532,8 +527,14 @@ Result solve(double theta, double phi, double alpha) {
     double best_cost = DBL_MAX;
     double best_res = DBL_MAX;
 
+    double best_a = 0.0;
+    double best_b = 0.0;
+    double best_theta_eff = 0.0;
+    double best_T = 0.0;
+    bool have_best_candidate = false;
+
     int max_refine = (fabs(phi) >= 4.0)
-        ? std::min((int) all_candidates.size(), 900)
+        ? std::min((int) all_candidates.size(), 500)
         : std::min((int) all_candidates.size(), 450);
 
     for (int c = 0; c < max_refine; c++) {
@@ -687,46 +688,35 @@ Result solve(double theta, double phi, double alpha) {
                 b += step_size * delta(1);
             }
 
-            /*
-            Re-evaluate once more at the final polished (a,b).
-           This prevents returning lambdas from the previous Newton iterate.
-            */
-            Eigen::Vector2d Rfinal = eval_trajectory(
+            double tmp_l1, tmp_l2;
+
+            auto final_eval = eval_trajectory(
                 a, b,
                 theta_eff, phi, alpha,
                 B1, B2,
                 polish_nsteps, polish_dt,
-                polish_l1, polish_l2
-            ).first;
+                tmp_l1, tmp_l2
+            );
 
-            double final_recomputed_cost;
-
-            {
-                double tmp_l1, tmp_l2;
-                auto final_eval = eval_trajectory(
-                    a, b,
-                    theta_eff, phi, alpha,
-                    B1, B2,
-                    polish_nsteps, polish_dt,
-                    tmp_l1, tmp_l2
-                );
-
-                Rfinal = final_eval.first;
-                final_recomputed_cost = final_eval.second;
-                polish_l1 = tmp_l1;
-                polish_l2 = tmp_l2;
-            }
-
-            polish_res = Rfinal.norm();
+            double polish_l1_final = tmp_l1;
+            double polish_l2_final = tmp_l2;
+            double final_recomputed_cost = final_eval.second;
+            double polish_res_final = final_eval.first.norm();
 
             double total_cost = final_recomputed_cost + tail_cost(a, b, B1, B2, P);
 
             if (std::isfinite(total_cost) && total_cost < best_cost) {
-                best.l1 = polish_l1;
-                best.l2 = polish_l2;
+                best.l1 = polish_l1_final;
+                best.l2 = polish_l2_final;
                 best.cost = total_cost;
                 best_cost = total_cost;
-                best_res = polish_res;
+                best_res = polish_res_final;
+
+                best_a = a;
+                best_b = b;
+                best_theta_eff = theta_eff;
+                best_T = -dt * (double)nsteps;
+                have_best_candidate = true;
             }
         } else if (best_cost == DBL_MAX && final_res < best_res && std::isfinite(final_cost)) {
             double total_cost = final_cost + tail_cost(a, b, B1, B2, P);
@@ -735,7 +725,114 @@ Result solve(double theta, double phi, double alpha) {
             best.l2 = final_l2;
             best.cost = total_cost;
             best_res = final_res;
+
+            best_a = a;
+            best_b = b;
+            best_theta_eff = theta_eff;
+            best_T = -dt * (double)nsteps;
+            have_best_candidate = true;
         }
+    }
+
+    /*
+       Final high-accuracy polish on only the best candidate.
+       This keeps the algorithm the same: CUDA coarse search, then CPU Newton.
+       It is only done once, so it should not cause the timeout.
+    */
+    if (have_best_candidate && std::isfinite(best.cost) && best.cost < DBL_MAX) {
+        int fine_nsteps = (int)std::round(best_T / 0.001);
+        double fine_dt = -best_T / (double)fine_nsteps;
+
+        double a = best_a;
+        double b = best_b;
+
+        double fine_l1 = best.l1;
+        double fine_l2 = best.l2;
+        double fine_cost = best.cost;
+
+        for (int iter = 0; iter < 20; iter++) {
+            Eigen::Vector2d Rfine;
+            Eigen::Matrix2d Jfine;
+
+            compute_residual_and_jacobian(
+                a, b,
+                best_theta_eff, phi, alpha,
+                B1, B2,
+                fine_nsteps, fine_dt,
+                Rfine, Jfine,
+                fine_cost, fine_l1, fine_l2
+            );
+
+            if (!std::isfinite(Rfine.norm()) || !std::isfinite(fine_cost)) {
+                break;
+            }
+
+            if (Rfine.norm() < 1.0e-12) {
+                break;
+            }
+
+            Eigen::Vector2d delta = Jfine.fullPivLu().solve(-Rfine);
+
+            if (!std::isfinite(delta.norm())) {
+                break;
+            }
+
+            double step_size = 1.0;
+            double current_norm = Rfine.norm();
+            bool accepted = false;
+
+            for (int ls = 0; ls < 20; ls++) {
+                double trial_a = a + step_size * delta(0);
+                double trial_b = b + step_size * delta(1);
+
+                double trial_l1, trial_l2;
+
+                Eigen::Vector2d trial_R = eval_trajectory(
+                    trial_a, trial_b,
+                    best_theta_eff, phi, alpha,
+                    B1, B2,
+                    fine_nsteps, fine_dt,
+                    trial_l1, trial_l2
+                ).first;
+
+                if (std::isfinite(trial_R.norm()) && trial_R.norm() < current_norm) {
+                    accepted = true;
+                    break;
+                }
+
+                step_size *= 0.5;
+            }
+
+            if (!accepted) {
+                break;
+            }
+
+            a += step_size * delta(0);
+            b += step_size * delta(1);
+        }
+
+        double final_l1, final_l2;
+
+        auto final_eval = eval_trajectory(
+            a, b,
+            best_theta_eff, phi, alpha,
+            B1, B2,
+            fine_nsteps, fine_dt,
+            final_l1, final_l2
+        );
+
+        double final_total_cost = final_eval.second + tail_cost(a, b, B1, B2, P);
+
+        if (std::isfinite(final_total_cost)) {
+            best.l1 = final_l1;
+            best.l2 = final_l2;
+            best.cost = final_total_cost;
+        }
+    }
+
+    if (reflected && std::isfinite(best.cost) && best.cost < DBL_MAX) {
+        best.l1 = -best.l1;
+        best.l2 = -best.l2;
     }
 
     return best;
