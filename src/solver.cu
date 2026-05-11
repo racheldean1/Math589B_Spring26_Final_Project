@@ -307,6 +307,23 @@ double tail_cost(
 Result solve(double theta, double phi, double alpha) {
     double theta_mod = std::remainder(theta, 2.0 * M_PI);
 
+    /*
+       Symmetry of the pendulum problem:
+       If (theta, phi) is reflected to (-theta, -phi), the optimal cost is the same,
+       while lambda changes sign. This avoids a slow positive high-velocity sheet.
+    */
+    if (phi > 0.0 && theta > 1.0e-12) {
+        Result mirror = solve(-theta, -phi, alpha);
+
+        if (std::isfinite(mirror.cost) && mirror.cost < DBL_MAX) {
+            Result reflected;
+            reflected.l1 = -mirror.l1;
+            reflected.l2 = -mirror.l2;
+            reflected.cost = mirror.cost;
+            return reflected;
+        }
+    }
+
     if (fabs(theta_mod) < 1.0e-13 && fabs(phi) < 1.0e-13) {
         Result exact;
         exact.l1 = 0.0;
@@ -598,7 +615,7 @@ Result solve(double theta, double phi, double alpha) {
         }
 
         if (converged) {
-            int polish_nsteps = 2 * nsteps;
+            int polish_nsteps = (fabs(phi) >= 4.0) ? 4 * nsteps : 2 * nsteps;
             double T_used = -dt * (double)nsteps;
             double polish_dt = -T_used / (double)polish_nsteps;
 
@@ -670,7 +687,39 @@ Result solve(double theta, double phi, double alpha) {
                 b += step_size * delta(1);
             }
 
-            double total_cost = polish_cost + tail_cost(a, b, B1, B2, P);
+            /*
+            Re-evaluate once more at the final polished (a,b).
+           This prevents returning lambdas from the previous Newton iterate.
+            */
+            Eigen::Vector2d Rfinal = eval_trajectory(
+                a, b,
+                theta_eff, phi, alpha,
+                B1, B2,
+                polish_nsteps, polish_dt,
+                polish_l1, polish_l2
+            ).first;
+
+            double final_recomputed_cost;
+
+            {
+                double tmp_l1, tmp_l2;
+                auto final_eval = eval_trajectory(
+                    a, b,
+                    theta_eff, phi, alpha,
+                    B1, B2,
+                    polish_nsteps, polish_dt,
+                    tmp_l1, tmp_l2
+                );
+
+                Rfinal = final_eval.first;
+                final_recomputed_cost = final_eval.second;
+                polish_l1 = tmp_l1;
+                polish_l2 = tmp_l2;
+            }
+
+            polish_res = Rfinal.norm();
+
+            double total_cost = final_recomputed_cost + tail_cost(a, b, B1, B2, P);
 
             if (std::isfinite(total_cost) && total_cost < best_cost) {
                 best.l1 = polish_l1;
