@@ -599,7 +599,7 @@ Result solve(double theta, double phi, double alpha) {
                     trial_l1, trial_l2
                 ).first;
 
-                if (std::isfinite(trial_R.norm()) && trial_R.norm() < current_norm) {
+                if (std::isfinite(trial_R.norm()) && trial_R.norm() <= current_norm) {
                     accepted = true;
                     break;
                 }
@@ -740,7 +740,8 @@ Result solve(double theta, double phi, double alpha) {
        It is only done once, so it should not cause the timeout.
     */
     if (have_best_candidate && std::isfinite(best.cost) && best.cost < DBL_MAX) {
-        int fine_nsteps = (int)std::round(best_T / 0.00025);
+        double fine_T = (fabs(phi) >= 4.0) ? std::max(best_T, 18.0) : best_T;
+        int fine_nsteps = (int)std::round(best_T / 0.0005);
         double fine_dt = -best_T / (double)fine_nsteps;
 
         double a = best_a;
@@ -767,7 +768,7 @@ Result solve(double theta, double phi, double alpha) {
                 break;
             }
 
-            if (Rfine.norm() < 1.0e-13) {
+            if (Rfine.norm() < 1.0e-14) {
                 break;
             }
 
