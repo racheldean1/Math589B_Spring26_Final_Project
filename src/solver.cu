@@ -239,8 +239,8 @@ void compute_residual_and_jacobian(
     R = base.first;
     cost = base.second;
 
-    double eps_a = 1.0e-7 * (1.0 + fabs(a));
-    double eps_b = 1.0e-7 * (1.0 + fabs(b));
+    double eps_a = 1.0e-8 * (1.0 + fabs(a));
+    double eps_b = 1.0e-8 * (1.0 + fabs(b));
 
     double d1, d2;
 
@@ -740,7 +740,7 @@ Result solve(double theta, double phi, double alpha) {
        It is only done once, so it should not cause the timeout.
     */
     if (have_best_candidate && std::isfinite(best.cost) && best.cost < DBL_MAX) {
-        int fine_nsteps = (int)std::round(best_T / 0.001);
+        int fine_nsteps = (int)std::round(best_T / 0.00025);
         double fine_dt = -best_T / (double)fine_nsteps;
 
         double a = best_a;
@@ -750,7 +750,7 @@ Result solve(double theta, double phi, double alpha) {
         double fine_l2 = best.l2;
         double fine_cost = best.cost;
 
-        for (int iter = 0; iter < 20; iter++) {
+        for (int iter = 0; iter < 40; iter++) {
             Eigen::Vector2d Rfine;
             Eigen::Matrix2d Jfine;
 
@@ -767,7 +767,7 @@ Result solve(double theta, double phi, double alpha) {
                 break;
             }
 
-            if (Rfine.norm() < 1.0e-12) {
+            if (Rfine.norm() < 1.0e-13) {
                 break;
             }
 
